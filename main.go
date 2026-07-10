@@ -1,32 +1,33 @@
 package main
 
+// main.go — CLI entry point for aoe4build.
+//
+// Commands
+//   aoe4build -l                         list all civ codes
+//   aoe4build <CIV> -l                   list top 5 builds for a civ (with index)
+//   aoe4build <CIV> <N>                  print normalized JSON for build N  (pipeable)
+//   aoe4build get <CIV> [-o csv|sql]     fetch + display/save builds for one civ
+//   aoe4build get -a    [-o csv|sql]     fetch + display/save builds for ALL civs
+
 import (
-	"context"
-	"database/sql"
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
-	"time"
+	"strings"
 
-	"github.com/chromedp/chromedp"
-	_ "modernc.org/sqlite"
+	"github.com/spf13/cobra"
 )
 
+// ---------------------------------------------------------------------------
+// Shared constants / types
+// ---------------------------------------------------------------------------
+
 const (
-	baseURL     = "https://aoe4guides.com"
-	buildsDir   = "builds"
-	csvFile     = "builds.csv"
-	dbFile      = "builds.db"
-	normalizedFile = "builds_normalized.json"
-	topN        = 5
+	baseURL        = "https://aoe4guides.com"
+	buildsDir      = "builds"
+	topN           = 5
 )
 
 // Civ holds a civilization's acronym code and full display name.
@@ -35,327 +36,312 @@ type Civ struct {
 	Name string
 }
 
-// BuildRecord is a fully enriched row used for CSV/SQL output.
+// BuildRecord is a fully enriched row used for CSV / SQL / table output.
 type BuildRecord struct {
-	Rank     int
-	CivCode  string
-	CivName  string
-	Score    float64
-	Title    string
-	URL      string
+	Rank    int
+	CivCode string
+	CivName string
+	Score   float64
+	Title   string
+	URL     string
 }
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 func main() {
-	// --- Step 1: scrape civ names + codes from the homepage ---
+	if err := rootCmd().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Root command  —  aoe4build [-l] [CIV] [N]
+// ---------------------------------------------------------------------------
+
+func rootCmd() *cobra.Command {
+	var listCivs bool
+
+	root := &cobra.Command{
+		Use:   "aoe4build",
+		Short: "Scrape and explore AoE4 build orders",
+		Long: `aoe4build — Age of Empires IV build order tool
+
+Examples:
+  aoe4build -l                   list all civilization codes
+  aoe4build CHI -l               list top 5 builds for Chinese (with index)
+  aoe4build CHI 2                print normalized JSON for Chinese build #2
+  aoe4build get CHI              fetch and display builds for Chinese
+  aoe4build get CHI -o csv       fetch and save to CSV
+  aoe4build get -a -o sql        fetch all civs and save to SQLite`,
+
+		// Accept zero args (for -l) or 1-2 positional args (CIV and optional N)
+		Args: cobra.MaximumNArgs(2),
+
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// ── aoe4build -l ──────────────────────────────────────────────
+			if listCivs && len(args) == 0 {
+				return runListAllCivs()
+			}
+
+			// ── aoe4build <CIV> -l  or  aoe4build <CIV> <N> ─────────────
+			if len(args) == 0 {
+				return cmd.Help()
+			}
+
+			civCode := strings.ToUpper(args[0])
+			client := newHTTPClient()
+
+			builds, err := fetchBuilds(client, civCode)
+			if err != nil {
+				return fmt.Errorf("fetching builds for %s: %w", civCode, err)
+			}
+			if len(builds) == 0 {
+				return fmt.Errorf("no builds found for civ %q", civCode)
+			}
+			if len(builds) > topN {
+				builds = builds[:topN]
+			}
+
+			// Resolve full civ name once for both -l and N sub-commands
+			civName := civCode
+			if knownCivs, err := getCivs(); err == nil {
+				for _, c := range knownCivs {
+					if c.Code == civCode {
+						civName = c.Name
+						break
+					}
+				}
+			}
+			civ := Civ{Code: civCode, Name: civName}
+
+			// ── aoe4build <CIV> -l ────────────────────────────────────────
+			if listCivs {
+				printBuildList(civ, builds)
+				return nil
+			}
+
+			// ── aoe4build <CIV> <N> ──────────────────────────────────────
+			if len(args) == 2 {
+				n, err := strconv.Atoi(args[1])
+				if err != nil || n < 1 || n > len(builds) {
+					return fmt.Errorf("index must be a number between 1 and %d", len(builds))
+				}
+				nb := NormalizeBuild(builds[n-1], civName)
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(nb)
+			}
+
+			return cmd.Help()
+		},
+	}
+
+	root.Flags().BoolVarP(&listCivs, "list", "l", false, "list civs (global) or builds for a civ")
+	root.AddCommand(getCmd())
+	return root
+}
+
+// ---------------------------------------------------------------------------
+// get subcommand  —  aoe4build get [CIV] [-a] [-o csv|sql]
+// ---------------------------------------------------------------------------
+
+func getCmd() *cobra.Command {
+	var (
+		allCivs  bool
+		outputTo []string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "get [CIV]",
+		Short: "Fetch and display/save build orders",
+		Long: `Fetch top 5 build orders for one or all civilizations.
+
+Without -o, results are printed to the console.
+With -o, results are saved to files (csv and/or sql supported).
+
+Examples:
+  aoe4build get CHI              display builds for Chinese
+  aoe4build get CHI -o csv       save to aoe4builds_chi.csv
+  aoe4build get CHI -o sql       save to aoe4builds_chi.db
+  aoe4build get CHI -o csv,sql   save to both
+  aoe4build get -a               display builds for all civs
+  aoe4build get -a -o csv,sql    save all civs to CSV + SQLite`,
+
+		Args: cobra.MaximumNArgs(1),
+
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !allCivs && len(args) == 0 {
+				return fmt.Errorf("provide a civ code or use -a for all civs")
+			}
+
+			client := newHTTPClient()
+
+			// ── resolve civ list (always fetch names via chromedp) ───────
+			fmt.Fprintln(os.Stderr, "Fetching civilization list from aoe4guides.com…")
+			allKnownCivs, err := getCivs()
+			if err != nil {
+				return fmt.Errorf("fetching civ list: %w", err)
+			}
+			civNameLookup := make(map[string]string, len(allKnownCivs))
+			for _, c := range allKnownCivs {
+				civNameLookup[c.Code] = c.Name
+			}
+
+			var civs []Civ
+			if allCivs {
+				civs = allKnownCivs
+			} else {
+				code := strings.ToUpper(args[0])
+				name := civNameLookup[code]
+				if name == "" {
+					name = code // unknown code — keep the code as display name
+				}
+				civs = []Civ{{Code: code, Name: name}}
+			}
+
+			// ── fetch builds for each civ ─────────────────────────────────
+			var allRecords []BuildRecord
+			var allNormalized []NormalizedBuild
+			civBuilds := make(map[string][]BuildRecord)
+			civMap := make(map[string]Civ)
+
+			for i, civ := range civs {
+				if allCivs {
+					fmt.Fprintf(os.Stderr, "  [%d/%d] %s…\n", i+1, len(civs), civ.Code)
+				}
+				builds, err := fetchBuilds(client, civ.Code)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  WARN: %s: %v\n", civ.Code, err)
+					continue
+				}
+				if len(builds) > topN {
+					builds = builds[:topN]
+				}
+
+				// Patch civ name from lookup if still empty
+				if civ.Name == "" {
+					if n := civNameLookup[civ.Code]; n != "" {
+						civ.Name = n
+					} else {
+						civ.Name = civ.Code
+					}
+				}
+				civMap[civ.Code] = civ
+
+				var records []BuildRecord
+				for j, b := range builds {
+					rec := BuildRecord{
+						Rank:    j + 1,
+						CivCode: civ.Code,
+						CivName: civ.Name,
+						Score:   b.ScoreAllTime,
+						Title:   b.Title,
+						URL:     fmt.Sprintf("%s/builds/%s", baseURL, b.ID),
+					}
+					records = append(records, rec)
+					allRecords = append(allRecords, rec)
+					allNormalized = append(allNormalized, NormalizeBuild(b, civ.Name))
+				}
+				civBuilds[civ.Code] = records
+			}
+
+			// ── output ────────────────────────────────────────────────────
+			outputs := parseOutputFlags(outputTo)
+
+			if len(outputs) == 0 {
+				// Console print
+				printBuildsTable(allRecords)
+				return nil
+			}
+
+			civCode := ""
+			if len(civs) == 1 {
+				civCode = civs[0].Code
+			}
+
+			for _, out := range outputs {
+				switch out {
+				case "csv":
+					path := defaultOutputName(civCode, "csv")
+					if err := writeCSV(path, allRecords); err != nil {
+						return fmt.Errorf("writing CSV: %w", err)
+					}
+					fmt.Fprintf(os.Stderr, "Saved CSV → %s\n", path)
+
+				case "sql":
+					path := defaultOutputName(civCode, "db")
+					civSlice := civsFromMap(civMap)
+					if err := writeDB(path, civSlice, allRecords); err != nil {
+						return fmt.Errorf("writing SQLite: %w", err)
+					}
+					fmt.Fprintf(os.Stderr, "Saved SQLite → %s\n", path)
+
+				case "json":
+					path := defaultOutputName(civCode, "json")
+					if err := writeNormalizedJSON(path, allNormalized); err != nil {
+						return fmt.Errorf("writing JSON: %w", err)
+					}
+					fmt.Fprintf(os.Stderr, "Saved JSON → %s\n", path)
+
+				default:
+					fmt.Fprintf(os.Stderr, "WARN: unknown output format %q (supported: csv, sql, json)\n", out)
+				}
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVarP(&allCivs, "all", "a", false, "fetch builds for all civilizations")
+	cmd.Flags().StringSliceVarP(&outputTo, "output", "o", nil, "output format(s): csv, sql, json  (comma-separated)")
+	return cmd
+}
+
+// ---------------------------------------------------------------------------
+// runListAllCivs
+// ---------------------------------------------------------------------------
+
+func runListAllCivs() error {
+	fmt.Fprintln(os.Stderr, "Fetching civilization list from aoe4guides.com…")
 	civs, err := getCivs()
 	if err != nil {
-		log.Fatalf("failed to get civs: %v", err)
-	}
-	fmt.Printf("Found %d civilizations\n\n", len(civs))
-
-	// Build a code → name lookup
-	civNames := make(map[string]string, len(civs))
-	for _, c := range civs {
-		civNames[c.Code] = c.Name
-	}
-
-	// --- Step 2: create per-civ files directory ---
-	if err := os.MkdirAll(buildsDir, 0755); err != nil {
-		log.Fatalf("failed to create builds dir: %v", err)
-	}
-
-	// --- Step 3: fetch builds for every civ and collect all records ---
-	client := &http.Client{Timeout: 15 * time.Second}
-	var allRecords []BuildRecord
-	var allNormalized []NormalizedBuild
-
-	for _, civ := range civs {
-		fmt.Printf("Processing %-4s (%s)...", civ.Code, civ.Name)
-
-		rawBuilds, err := fetchBuilds(client, civ.Code)
-		if err != nil {
-			fmt.Printf(" ERROR: %v\n", err)
-			continue
-		}
-
-		sort.Slice(rawBuilds, func(i, j int) bool {
-			return rawBuilds[i].ScoreAllTime > rawBuilds[j].ScoreAllTime
-		})
-		if len(rawBuilds) > topN {
-			rawBuilds = rawBuilds[:topN]
-		}
-		if len(rawBuilds) == 0 {
-			fmt.Printf(" no builds found, skipping\n")
-			continue
-		}
-
-		var records []BuildRecord
-		for i, b := range rawBuilds {
-			rec := BuildRecord{
-				Rank:    i + 1,
-				CivCode: civ.Code,
-				CivName: civ.Name,
-				Score:   b.ScoreAllTime,
-				Title:   b.Title,
-				URL:     fmt.Sprintf("%s/builds/%s", baseURL, b.ID),
-			}
-			records = append(records, rec)
-			allRecords = append(allRecords, rec)
-
-			// Normalize for JSON output
-			allNormalized = append(allNormalized, NormalizeBuild(b, civ.Name))
-		}
-
-		if err := writeTextFile(filepath.Join(buildsDir, civ.Code), civ.Code, records); err != nil {
-			fmt.Printf(" ERROR writing text file: %v\n", err)
-			continue
-		}
-		fmt.Printf(" saved %d builds\n", len(records))
-	}
-
-	// --- Step 4: write CSV ---
-	fmt.Printf("\nWriting %s...", csvFile)
-	if err := writeCSV(csvFile, allRecords); err != nil {
-		log.Fatalf(" ERROR: %v", err)
-	}
-	fmt.Printf(" %d rows written\n", len(allRecords))
-
-	// --- Step 5: write SQLite database ---
-	fmt.Printf("Writing %s...", dbFile)
-	if err := writeDB(dbFile, civs, allRecords); err != nil {
-		log.Fatalf(" ERROR: %v", err)
-	}
-	fmt.Printf(" done\n")
-
-	// --- Step 6: write normalized JSON ---
-	fmt.Printf("Writing %s...", normalizedFile)
-	if err := writeNormalizedJSON(normalizedFile, allNormalized); err != nil {
-		log.Fatalf(" ERROR: %v", err)
-	}
-	fmt.Printf(" %d builds written\n", len(allNormalized))
-
-	fmt.Printf("\nOutput:\n  ./%s/              — %d per-civ text files\n  ./%s          — CSV\n  ./%s           — SQLite\n  ./%s — normalized JSON\n",
-		buildsDir, len(civs), csvFile, dbFile, normalizedFile)
-}
-
-// getCivs launches a headless browser, loads the homepage, and returns every
-// civilization's code and full name by reading the tile href and label.
-func getCivs() ([]Civ, error) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-	)
-	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer cancel()
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-	ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	// Grab parallel arrays: hrefs and names, same index = same tile
-	var hrefs []string
-	var names []string
-
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(baseURL+"/"),
-		chromedp.WaitVisible(`.civ-tile__name`, chromedp.ByQuery),
-		chromedp.Evaluate(`
-			Array.from(document.querySelectorAll('.civ-tile__name'))
-				.map(el => el.closest('a') ? el.closest('a').getAttribute('href') : '')
-		`, &hrefs),
-		chromedp.Evaluate(`
-			Array.from(document.querySelectorAll('.civ-tile__name'))
-				.map(el => el.textContent.trim())
-		`, &names),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("chromedp: %w", err)
-	}
-
-	var civs []Civ
-	for i, href := range hrefs {
-		u, err := url.Parse(href)
-		if err != nil {
-			continue
-		}
-		code := u.Query().Get("civ")
-		name := ""
-		if i < len(names) {
-			name = names[i]
-		}
-		if code != "" {
-			civs = append(civs, Civ{Code: code, Name: name})
-		}
-	}
-	return civs, nil
-}
-
-// fetchBuilds calls the REST API for the given civ and returns full raw builds
-// (including all step data needed for normalization).
-func fetchBuilds(client *http.Client, civ string) ([]RawBuild, error) {
-	resp, err := client.Get(fmt.Sprintf("%s/api/builds?civ=%s", baseURL, civ))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API returned %s", resp.Status)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var builds []RawBuild
-	if err := json.Unmarshal(body, &builds); err != nil {
-		return nil, fmt.Errorf("JSON: %w", err)
-	}
-	return builds, nil
-}
-
-// writeNormalizedJSON serializes all normalized builds to a pretty-printed JSON file.
-func writeNormalizedJSON(path string, builds []NormalizedBuild) error {
-	f, err := os.Create(path)
-	if err != nil {
 		return err
 	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(builds)
-}
-
-// writeTextFile writes a human-readable per-civ build list.
-func writeTextFile(path, civ string, records []BuildRecord) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "# Top %d builds for %s — %s (sorted by score)\n", len(records), civ, records[0].CivName)
-	for _, r := range records {
-		fmt.Fprintf(f, "%d. [%.2f] %s\n   %s\n", r.Rank, r.Score, r.Title, r.URL)
-	}
+	printCivList(civs)
 	return nil
 }
 
-// writeCSV writes all build records to a single CSV file.
-func writeCSV(path string, records []BuildRecord) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-	w := csv.NewWriter(f)
-	defer w.Flush()
-
-	// Header
-	if err := w.Write([]string{"rank", "civ_code", "civ_name", "score", "title", "url"}); err != nil {
-		return err
-	}
-	for _, r := range records {
-		row := []string{
-			strconv.Itoa(r.Rank),
-			r.CivCode,
-			r.CivName,
-			strconv.FormatFloat(r.Score, 'f', 6, 64),
-			r.Title,
-			r.URL,
-		}
-		if err := w.Write(row); err != nil {
-			return err
-		}
-	}
-	return w.Error()
-}
-
-// writeDB creates (or overwrites) a SQLite database with two tables:
-//
-//	civilizations(code, name)
-//	builds(id, civ_code, rank, title, score, url)
-//
-// with a foreign key from builds.civ_code → civilizations.code.
-func writeDB(path string, civs []Civ, records []BuildRecord) error {
-	// Remove existing file so we start fresh
-	_ = os.Remove(path)
-
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
-	// Enable foreign key enforcement
-	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
-		return err
-	}
-
-	schema := `
-CREATE TABLE IF NOT EXISTS civilizations (
-    code TEXT PRIMARY KEY,
-    name TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS builds (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    civ_code TEXT    NOT NULL REFERENCES civilizations(code),
-    rank     INTEGER NOT NULL CHECK (rank BETWEEN 1 AND 5),
-    title    TEXT    NOT NULL,
-    score    REAL    NOT NULL,
-    url      TEXT    NOT NULL UNIQUE
-);
-
-CREATE INDEX IF NOT EXISTS idx_builds_civ  ON builds(civ_code);
-CREATE INDEX IF NOT EXISTS idx_builds_score ON builds(score DESC);
-`
-	if _, err := db.Exec(schema); err != nil {
-		return fmt.Errorf("schema: %w", err)
-	}
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-
-	// Insert civilizations
-	civStmt, err := tx.Prepare(`INSERT OR IGNORE INTO civilizations(code, name) VALUES (?, ?)`)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	defer civStmt.Close()
-
+// parseOutputFlags normalises the -o flag values (handles both "csv,sql" as a
+// single string and multiple -o flags).
+func parseOutputFlags(raw []string) []string {
 	seen := make(map[string]bool)
-	for _, c := range civs {
-		if seen[c.Code] {
-			continue
-		}
-		seen[c.Code] = true
-		if _, err := civStmt.Exec(c.Code, c.Name); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("insert civ %s: %w", c.Code, err)
-		}
-	}
-
-	// Insert builds
-	buildStmt, err := tx.Prepare(`
-		INSERT OR IGNORE INTO builds(civ_code, rank, title, score, url)
-		VALUES (?, ?, ?, ?, ?)
-	`)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	defer buildStmt.Close()
-
-	for _, r := range records {
-		if _, err := buildStmt.Exec(r.CivCode, r.Rank, r.Title, r.Score, r.URL); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("insert build %s: %w", r.URL, err)
+	var out []string
+	for _, v := range raw {
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(strings.ToLower(part))
+			if part != "" && !seen[part] {
+				seen[part] = true
+				out = append(out, part)
+			}
 		}
 	}
-
-	return tx.Commit()
+	return out
 }
 
+// civsFromMap returns a slice of Civ values from a map, preserving no
+// particular order (order doesn't matter for DB inserts).
+func civsFromMap(m map[string]Civ) []Civ {
+	out := make([]Civ, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	return out
+}
 
+// httpClientKey is used to allow tests to inject a client — unused in prod.
+var _ *http.Client
