@@ -21,25 +21,18 @@ import (
 )
 
 const (
-	baseURL    = "https://aoe4guides.com"
-	buildsDir  = "builds"
-	csvFile    = "builds.csv"
-	dbFile     = "builds.db"
-	topN       = 5
+	baseURL     = "https://aoe4guides.com"
+	buildsDir   = "builds"
+	csvFile     = "builds.csv"
+	dbFile      = "builds.db"
+	normalizedFile = "builds_normalized.json"
+	topN        = 5
 )
 
 // Civ holds a civilization's acronym code and full display name.
 type Civ struct {
 	Code string
 	Name string
-}
-
-// Build represents a build order returned by the API.
-type Build struct {
-	ID           string  `json:"id"`
-	Title        string  `json:"title"`
-	Civ          string  `json:"civ"`
-	ScoreAllTime float64 `json:"scoreAllTime"`
 }
 
 // BuildRecord is a fully enriched row used for CSV/SQL output.
@@ -74,30 +67,30 @@ func main() {
 	// --- Step 3: fetch builds for every civ and collect all records ---
 	client := &http.Client{Timeout: 15 * time.Second}
 	var allRecords []BuildRecord
+	var allNormalized []NormalizedBuild
 
 	for _, civ := range civs {
 		fmt.Printf("Processing %-4s (%s)...", civ.Code, civ.Name)
 
-		builds, err := fetchBuilds(client, civ.Code)
+		rawBuilds, err := fetchBuilds(client, civ.Code)
 		if err != nil {
 			fmt.Printf(" ERROR: %v\n", err)
 			continue
 		}
 
-		sort.Slice(builds, func(i, j int) bool {
-			return builds[i].ScoreAllTime > builds[j].ScoreAllTime
+		sort.Slice(rawBuilds, func(i, j int) bool {
+			return rawBuilds[i].ScoreAllTime > rawBuilds[j].ScoreAllTime
 		})
-		if len(builds) > topN {
-			builds = builds[:topN]
+		if len(rawBuilds) > topN {
+			rawBuilds = rawBuilds[:topN]
 		}
-		if len(builds) == 0 {
+		if len(rawBuilds) == 0 {
 			fmt.Printf(" no builds found, skipping\n")
 			continue
 		}
 
-		// Write per-civ plain-text file
 		var records []BuildRecord
-		for i, b := range builds {
+		for i, b := range rawBuilds {
 			rec := BuildRecord{
 				Rank:    i + 1,
 				CivCode: civ.Code,
@@ -108,6 +101,9 @@ func main() {
 			}
 			records = append(records, rec)
 			allRecords = append(allRecords, rec)
+
+			// Normalize for JSON output
+			allNormalized = append(allNormalized, NormalizeBuild(b, civ.Name))
 		}
 
 		if err := writeTextFile(filepath.Join(buildsDir, civ.Code), civ.Code, records); err != nil {
@@ -131,8 +127,15 @@ func main() {
 	}
 	fmt.Printf(" done\n")
 
-	fmt.Printf("\nOutput:\n  ./%s/   — %d per-civ text files\n  ./%s   — CSV\n  ./%s    — SQLite database\n",
-		buildsDir, len(civs), csvFile, dbFile)
+	// --- Step 6: write normalized JSON ---
+	fmt.Printf("Writing %s...", normalizedFile)
+	if err := writeNormalizedJSON(normalizedFile, allNormalized); err != nil {
+		log.Fatalf(" ERROR: %v", err)
+	}
+	fmt.Printf(" %d builds written\n", len(allNormalized))
+
+	fmt.Printf("\nOutput:\n  ./%s/              — %d per-civ text files\n  ./%s          — CSV\n  ./%s           — SQLite\n  ./%s — normalized JSON\n",
+		buildsDir, len(civs), csvFile, dbFile, normalizedFile)
 }
 
 // getCivs launches a headless browser, loads the homepage, and returns every
@@ -187,8 +190,9 @@ func getCivs() ([]Civ, error) {
 	return civs, nil
 }
 
-// fetchBuilds calls the REST API for the given civ and returns all builds.
-func fetchBuilds(client *http.Client, civ string) ([]Build, error) {
+// fetchBuilds calls the REST API for the given civ and returns full raw builds
+// (including all step data needed for normalization).
+func fetchBuilds(client *http.Client, civ string) ([]RawBuild, error) {
 	resp, err := client.Get(fmt.Sprintf("%s/api/builds?civ=%s", baseURL, civ))
 	if err != nil {
 		return nil, err
@@ -201,11 +205,23 @@ func fetchBuilds(client *http.Client, civ string) ([]Build, error) {
 	if err != nil {
 		return nil, err
 	}
-	var builds []Build
+	var builds []RawBuild
 	if err := json.Unmarshal(body, &builds); err != nil {
 		return nil, fmt.Errorf("JSON: %w", err)
 	}
 	return builds, nil
+}
+
+// writeNormalizedJSON serializes all normalized builds to a pretty-printed JSON file.
+func writeNormalizedJSON(path string, builds []NormalizedBuild) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(builds)
 }
 
 // writeTextFile writes a human-readable per-civ build list.
